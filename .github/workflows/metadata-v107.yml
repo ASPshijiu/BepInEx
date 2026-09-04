@@ -1,0 +1,47 @@
+name: Metadata v107 compatibility
+
+on:
+  push:
+    branches:
+      - compat/metadata-v107
+  pull_request:
+    paths:
+      - .github/workflows/metadata-v107.yml
+      - global.json
+      - scripts/verify-metadata-v107-dependencies.sh
+      - Runtimes/Unity/BepInEx.Unity.IL2CPP/BepInEx.Unity.IL2CPP.csproj
+      - Runtimes/Unity/BepInEx.Unity.IL2CPP/packages.lock.json
+      - build/**
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.422
+
+      - name: Verify locked metadata v107 dependencies
+        run: bash scripts/verify-metadata-v107-dependencies.sh
+
+      - name: Build development packages
+        run: ./build.sh --target Publish --build-type Development --build-id 0
+
+      - name: Verify archives and write checksums
+        run: |
+          for archive in bin/dist/*.zip; do
+            unzip -t "$archive" >/dev/null
+          done
+          sha256sum bin/dist/*.zip > bin/dist/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BepInEx-metadata-v107-${{ github.sha }}
+          path: |
+            bin/dist/*.zip
+            bin/dist/SHA256SUMS.txt
+          if-no-files-found: error

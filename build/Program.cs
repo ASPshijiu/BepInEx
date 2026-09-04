@@ -14,7 +14,6 @@ using Cake.Core;
 using Cake.Core.Diagnostics;
 using Cake.Core.IO;
 using Cake.Frosting;
-using Cake.Git;
 using Cake.Json;
 using Microsoft.Build.Definition;
 using Microsoft.Build.Evaluation;
@@ -67,7 +66,9 @@ public class BuildContext : FrostingContext
         var props = Project.FromFile(RootDirectory.CombineWithFilePath("Directory.Build.props").FullPath,
                                      new ProjectOptions());
         VersionPrefix = props.GetPropertyValue("VersionPrefix");
-        CurrentCommit = ctx.GitLogTip(RootDirectory);
+        CurrentCommit = ctx.Git("rev-parse HEAD").Trim();
+        CurrentCommitShort = ctx.Git("rev-parse --short HEAD").Trim();
+        CurrentBranch = ctx.Git("rev-parse --abbrev-ref HEAD").Trim();
 
         BuildType = ctx.Argument("build-type", ProjectBuildType.Development);
         BuildId = ctx.Argument("build-id", -1);
@@ -88,7 +89,9 @@ public class BuildContext : FrostingContext
     public DirectoryPath DistributionDirectory { get; }
 
     public string VersionPrefix { get; }
-    public GitCommit CurrentCommit { get; }
+    public string CurrentCommit { get; }
+    public string CurrentCommitShort { get; }
+    public string CurrentBranch { get; }
 
     public string VersionSuffix => BuildType switch
     {
@@ -102,7 +105,7 @@ public class BuildContext : FrostingContext
         VersionPrefix + BuildType switch
         {
             ProjectBuildType.Release => "",
-            var _                    => $"-{VersionSuffix}+{this.GitShortenSha(RootDirectory, CurrentCommit)}",
+            var _                    => $"-{VersionSuffix}+{CurrentCommitShort}",
         };
 
     public static string DoorstopZipUrl(string arch) =>
@@ -144,8 +147,8 @@ public sealed class CompileTask : FrostingTask<BuildContext>
                 VersionSuffix = ctx.VersionSuffix,
                 Properties =
                 {
-                    ["SourceRevisionId"] = new[] { ctx.CurrentCommit.Sha },
-                    ["RepositoryBranch"] = new[] { ctx.GitBranchCurrent(ctx.RootDirectory).FriendlyName }
+                    ["SourceRevisionId"] = new[] { ctx.CurrentCommit },
+                    ["RepositoryBranch"] = new[] { ctx.CurrentBranch }
                 }
             };
         }
@@ -351,8 +354,8 @@ public sealed class PublishTask : FrostingTask<BuildContext>
                                           ["id"] = ctx.BuildId.ToString(),
                                           ["date"] = DateTime.Now.ToString("o"),
                                           ["changelog"] = changeLog,
-                                          ["hash"] = ctx.CurrentCommit.Sha,
-                                          ["short_hash"] = ctx.GitShortenSha(ctx.RootDirectory, ctx.CurrentCommit),
+                                          ["hash"] = ctx.CurrentCommit,
+                                          ["short_hash"] = ctx.CurrentCommitShort,
                                           ["artifacts"] = ctx.Distributions.Select(d => new Dictionary<string, string>
                                           {
                                               ["file"] = $"BepInEx-{d.Target}-{ctx.BuildPackageVersion}.zip",
