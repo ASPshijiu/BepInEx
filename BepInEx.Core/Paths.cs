@@ -118,12 +118,23 @@ public static class Paths
         }
         else
         {
+            GameDataPath = null;
+            if (PlatformHelper.Is(Platform.MacOS))
+            {
+                var macOSDataPath = Utility.CombinePaths(Utility.ParentDirectory(executablePath, 2), "Resources", "Data");
+                if (Directory.Exists(macOSDataPath))
+                    GameDataPath = macOSDataPath;
+            }
+
             // According to some experiments, Unity checks whether globalgamemanagers/data.unity3d exists in the data folder before picking it.
             // 'ProcessName_Data' folder is checked first, then if that fails 'Data' folder is checked. If neither is valid, the player crashes.
             // A simple Directory.Exists check is accurate enough while being less likely to break in case these conditions change.
-            GameDataPath = Path.Combine(GameRootPath, $"{ProcessName}_Data");
-            if (!Directory.Exists(GameDataPath))
-                GameDataPath = Path.Combine(GameRootPath, "Data");
+            if (string.IsNullOrEmpty(GameDataPath) || !Directory.Exists(GameDataPath))
+            {
+                GameDataPath = Path.Combine(GameRootPath, $"{ProcessName}_Data");
+                if (!Directory.Exists(GameDataPath))
+                    GameDataPath = Path.Combine(GameRootPath, "Data");
+            }
         }
         
         if (string.IsNullOrEmpty(GameDataPath) || !Directory.Exists(GameDataPath))

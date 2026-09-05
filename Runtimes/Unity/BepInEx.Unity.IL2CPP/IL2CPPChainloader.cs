@@ -1,6 +1,7 @@
 using System;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Threading;
 using BepInEx.Bootstrap;
 using BepInEx.Configuration;
 using BepInEx.Logging;
@@ -10,6 +11,7 @@ using BepInEx.Unity.IL2CPP.Hook;
 using BepInEx.Unity.IL2CPP.Logging;
 using BepInEx.Unity.IL2CPP.Utils;
 using Il2CppInterop.Runtime.InteropTypes;
+using MonoMod.Utils;
 using UnityEngine;
 using Logger = BepInEx.Logging.Logger;
 
@@ -18,6 +20,9 @@ namespace BepInEx.Unity.IL2CPP;
 public class IL2CPPChainloader : BaseChainloader<BasePlugin>
 {
     private static RuntimeInvokeDetourDelegate originalInvoke;
+    private static readonly DispatchCallback DeferredMacOSStart = OnDeferredMacOSStart;
+    private static int chainloaderStarted;
+    private static IntPtr dispatchLibrary;
 
     private static readonly ConfigEntry<bool> ConfigUnityLogging = ConfigFile.CoreConfig.Bind(
      "Logging", "UnityLogListening",
@@ -58,10 +63,18 @@ public class IL2CPPChainloader : BaseChainloader<BasePlugin>
         base.Initialize(gameExePath);
         Instance = this;
 
-        if (!NativeLibrary.TryLoad("GameAssembly", typeof(IL2CPPChainloader).Assembly, null, out var il2CppHandle))
+        var gameAssembly = PlatformHelper.Is(Platform.MacOS) ? Il2CppInteropManager.GameAssemblyPath : "GameAssembly";
+        if (!NativeLibrary.TryLoad(gameAssembly, typeof(IL2CPPChainloader).Assembly, null, out var il2CppHandle))
         {
             Logger.Log(LogLevel.Fatal,
                        "Could not locate Il2Cpp game assembly (GameAssembly.dll, UserAssembly.dll or libil2cpp.so). The game might be obfuscated or use a yet unsupported build of Unity.");
+            return;
+        }
+
+        if (PlatformHelper.Is(Platform.MacOS))
+        {
+            PreloaderLogger.Log.Log(LogLevel.Debug, "Scheduling macOS chainloader on the main dispatch queue");
+            dispatch_async_f(GetMainDispatchQueue(), IntPtr.Zero, DeferredMacOSStart);
             return;
         }
 
@@ -74,24 +87,27 @@ public class IL2CPPChainloader : BaseChainloader<BasePlugin>
         PreloaderLogger.Log.Log(LogLevel.Debug, "Runtime invoke patched");
     }
 
+    private static IntPtr GetMainDispatchQueue()
+    {
+        dispatchLibrary = NativeLibrary.Load("libSystem.B.dylib");
+        return NativeLibrary.GetExport(dispatchLibrary, "_dispatch_main_q");
+    }
+
     private static IntPtr OnInvokeMethod(IntPtr method, IntPtr obj, IntPtr parameters, IntPtr exc)
     {
         var methodName = Marshal.PtrToStringAnsi(Il2CppInterop.Runtime.IL2CPP.il2cpp_method_get_name(method));
 
         var unhook = false;
 
-        if (methodName == "Internal_ActiveSceneChanged")
+        if (methodName == "Internal_ActiveSceneChanged" &&
+            Interlocked.CompareExchange(ref chainloaderStarted, 1, 0) == 0)
             try
             {
                 // Unhook up front so the detour fires once even if setup below throws.
                 unhook = true;
 
                 // Isolated so a missing-interop JIT failure happens inside the try (caught), not in OnInvokeMethod itself.
-                SetupUnityLogging();
-
-                Il2CppInteropManager.PreloadInteropAssemblies();
-
-                Instance.Execute();
+                ExecuteChainloader();
             }
             catch (Exception ex)
             {
@@ -109,6 +125,38 @@ public class IL2CPPChainloader : BaseChainloader<BasePlugin>
         }
 
         return result;
+    }
+
+    private static void OnDeferredMacOSStart(IntPtr context)
+    {
+        if (Interlocked.CompareExchange(ref chainloaderStarted, 1, 0) != 0)
+            return;
+
+        try
+        {
+            PreloaderLogger.Log.Log(LogLevel.Debug, "Executing deferred macOS chainloader");
+            ExecuteChainloader();
+        }
+        catch (Exception ex)
+        {
+            Logger.Log(LogLevel.Fatal, "Unable to execute deferred macOS chainloader, no plugins will be loaded");
+            Logger.Log(LogLevel.Error, ex);
+        }
+        finally
+        {
+            if (RuntimeInvokeDetour != null)
+            {
+                RuntimeInvokeDetour.Dispose();
+                PreloaderLogger.Log.Log(LogLevel.Debug, "Runtime invoke unpatched");
+            }
+        }
+    }
+
+    private static void ExecuteChainloader()
+    {
+        SetupUnityLogging();
+        Il2CppInteropManager.PreloadInteropAssemblies();
+        Instance.Execute();
     }
 
     // JIT-compiled only when called here, so OnInvokeMethod needs no interop assemblies present to JIT.
@@ -147,4 +195,10 @@ public class IL2CPPChainloader : BaseChainloader<BasePlugin>
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate IntPtr RuntimeInvokeDetourDelegate(IntPtr method, IntPtr obj, IntPtr parameters, IntPtr exc);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate void DispatchCallback(IntPtr context);
+
+    [DllImport("libSystem.B.dylib")]
+    private static extern void dispatch_async_f(IntPtr queue, IntPtr context, DispatchCallback callback);
 }

@@ -1,0 +1,32 @@
+diff --git a/source/TrampolineBridge/Trampoline/x64/trampoline-x64.cc b/source/TrampolineBridge/Trampoline/x64/trampoline-x64.cc
+index f54641d..ee53907 100644
+--- a/source/TrampolineBridge/Trampoline/x64/trampoline-x64.cc
++++ b/source/TrampolineBridge/Trampoline/x64/trampoline-x64.cc
+@@ -52,13 +52,14 @@ static void **AllocIndirectStub(addr_t branch_address) {
+ CodeBufferBase *GenerateNormalTrampolineBuffer(addr_t from, addr_t to) {
+   TurboAssembler turbo_assembler_((void *)from);
+ #define _ turbo_assembler_.
++#define __ turbo_assembler_.GetCodeBuffer()->
+
+-  // branch
+-  void **branch_stub = AllocIndirectStub(from);
+-  *branch_stub = (void *)to;
+-
+-  CodeGen codegen(&turbo_assembler_);
+-  codegen.JmpNearIndirect((uint64_t)branch_stub);
++  // Use an inline absolute indirect jump. Rosetta can leave no free data page within
++  // RIP-relative range of GameAssembly, making the near-stub allocator return null.
++  __ Emit8(0xFF);
++  __ Emit8(0x25);
++  __ Emit32(0);
++  __ Emit64((uint64_t)to);
+
+   CodeBufferBase *result = NULL;
+   result = turbo_assembler_.GetCodeBuffer()->Copy();
+@@ -70,4 +71,4 @@ CodeBufferBase *GenerateNearTrampolineBuffer(InterceptRouting *routing, addr_t s
+   return NULL;
+ }
+
+-#endif
+\ No newline at end of file
++#endif
