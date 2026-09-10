@@ -1,3 +1,51 @@
+diff --git a/source/MemoryAllocator/NearMemoryArena.cc b/source/MemoryAllocator/NearMemoryArena.cc
+index b1313fa..4354d5f 100644
+--- a/source/MemoryAllocator/NearMemoryArena.cc
++++ b/source/MemoryAllocator/NearMemoryArena.cc
+@@ -155,6 +155,10 @@ void NearMemoryArena::Destroy(MemoryChunk *chunk) {
+ NearMemoryArena::NearMemoryArena() {
+ }
+
++// Zero bytes at the end of an existing trampoline are still allocated memory.
++// Keep cave reservations even when their machine code contains a run of zeros.
++static std::vector<MemoryRange> reserved_caves;
++
+ static addr_t search_near_blank_memory_chunk(addr_t pos, size_t alloc_range, int alloc_size) {
+   addr_t min_page_addr, max_page_addr;
+   min_page_addr = next_page(addr_sub(pos, alloc_range), OSMemory::AllocPageSize());
+@@ -182,7 +186,23 @@ static addr_t search_near_blank_memory_chunk(addr_t pos, size_t alloc_range, int
+             blank_chunk_addr += off;
+           }
+ #else
+-          blank_chunk_addr = (uint8_t *)memmem(region.address, region.length, blank_memory, alloc_size);
++          auto cursor = (uint8_t *)region.address;
++          auto end = cursor + region.length;
++          while (cursor + alloc_size <= end) {
++            blank_chunk_addr = (uint8_t *)memmem(cursor, end - cursor, blank_memory, alloc_size);
++            if (!blank_chunk_addr)
++              break;
++            auto next = blank_chunk_addr;
++            for (const auto &reserved : reserved_caves) {
++              auto start = (uint8_t *)reserved.address;
++              if (blank_chunk_addr < start + reserved.length && start < blank_chunk_addr + alloc_size)
++                next = std::max(next, start + reserved.length);
++            }
++            if (next == blank_chunk_addr)
++              break;
++            cursor = next;
++            blank_chunk_addr = nullptr;
++          }
+ #endif
+           free(blank_memory);
+           if (blank_chunk_addr)
+@@ -269,6 +289,7 @@ search_once_more:
+     chunk = new MemoryChunk;
+     chunk->address = (void *)blank_chunk_addr;
+     chunk->length = alloc_size;
++    reserved_caves.push_back({chunk->address, chunk->length});
+     return chunk;
+   }
+
 diff --git a/source/TrampolineBridge/Trampoline/x64/trampoline-x64.cc b/source/TrampolineBridge/Trampoline/x64/trampoline-x64.cc
 index f54641d..ee53907 100644
 --- a/source/TrampolineBridge/Trampoline/x64/trampoline-x64.cc
@@ -30,3 +78,30 @@ index f54641d..ee53907 100644
 -#endif
 \ No newline at end of file
 +#endif
+diff --git a/source/UserMode/ExecMemory/code-patch-tool-darwin.cc b/source/UserMode/ExecMemory/code-patch-tool-darwin.cc
+index 16312a8..d62a922 100644
+--- a/source/UserMode/ExecMemory/code-patch-tool-darwin.cc
++++ b/source/UserMode/ExecMemory/code-patch-tool-darwin.cc
+@@ -78,6 +78,22 @@ PUBLIC MemoryOperationError CodePatch(void *address, uint8_t *buffer, uint32_t b
+   int offset = (int)((addr_t)address - page_aligned_address);
+
+   static mach_port_t self_port = mach_task_self();
++#if defined(TARGET_ARCH_X64)
++  // Rosetta can keep executing an old translation after mach_vm_remap. Write
++  // through the target mapping so its self-modifying-code tracking sees it.
++  size_t patch_size = ALIGN_CEIL(offset + buffer_size, page_size);
++  kr = vm_protect(self_port, page_aligned_address, patch_size, FALSE,
++                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
++  if (kr != KERN_SUCCESS)
++    return kMemoryOperationError;
++  memcpy(address, buffer, buffer_size);
++  kr = vm_protect(self_port, page_aligned_address, patch_size, FALSE,
++                  VM_PROT_READ | VM_PROT_EXECUTE);
++  if (kr != KERN_SUCCESS)
++    return kMemoryOperationError;
++  ClearCache(address, (void *)((addr_t)address + buffer_size));
++  return kMemoryOperationSuccess;
++#endif
+ #ifdef __APPLE__
+   // try modify with substrated (steal from frida-gum)
+   addr_t remap_dummy_page =

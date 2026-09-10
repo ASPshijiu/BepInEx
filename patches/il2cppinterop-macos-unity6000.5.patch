@@ -1,0 +1,718 @@
+diff --git a/Il2CppInterop.Common/XrefScans/XrefScanMethodDb.cs b/Il2CppInterop.Common/XrefScans/XrefScanMethodDb.cs
+index 3958f4a..80b0310 100644
+--- a/Il2CppInterop.Common/XrefScans/XrefScanMethodDb.cs
++++ b/Il2CppInterop.Common/XrefScans/XrefScanMethodDb.cs
+@@ -20,12 +20,64 @@ public static class XrefScanMethodDb
+             GeneratedDatabasesUtil.GetDatabasePath(MethodAddressToTokenMap.FileName));
+         XrefScanCache = new MethodXrefScanCache(GeneratedDatabasesUtil.GetDatabasePath(MethodXrefScanCache.FileName));
+
+-        foreach (ProcessModule module in Process.GetCurrentProcess().Modules)
+-            if (module.ModuleName == "GameAssembly.dll")
++        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
++        {
++            var errorPtr = IntPtr.Zero;
++            var libHandle = dlopen("GameAssembly.dylib", 2);
++
++            if (libHandle == IntPtr.Zero)
++            {
++                var procPath = Process.GetCurrentProcess().MainModule.FileName;
++                var appContentsPath = Directory.GetParent(procPath).Parent.FullName;
++                var gameAssemblyPath = Path.Combine(appContentsPath, "Frameworks", "GameAssembly.dylib");
++
++                if (File.Exists(gameAssemblyPath))
++                {
++                    libHandle = dlopen(gameAssemblyPath, 2);
++                }
++            }
++
++            if (libHandle == IntPtr.Zero)
++            {
++                errorPtr = dlerror();
++
++                var errorMessage = errorPtr != IntPtr.Zero
++                    ? Marshal.PtrToStringAnsi(errorPtr)
++                    : "Unknown dlopen failure";
++
++                throw new DllNotFoundException(
++                    $"Failed to load \"GameAssembly.dylib\" with error message: {errorMessage}");
++            }
++
++            // Clear any previous error state.
++            dlerror();
++
++            var symbolAddress = dlsym(libHandle, "il2cpp_init");
++            errorPtr = dlerror();
++
++            if (errorPtr != IntPtr.Zero)
+             {
+-                GameAssemblyBase = (long)module.BaseAddress;
+-                break;
++                var errorMessage = Marshal.PtrToStringAnsi(errorPtr);
++
++                throw new EntryPointNotFoundException(
++                    $"Failed to find symbol \"il2cpp_init\" with error message: {errorMessage}");
++            }
++
++            if (dladdr(symbolAddress, out var info) == 0)
++            {
++                throw new InvalidOperationException();
+             }
++
++            var baseAddress = info.dli_fbase;
++            GameAssemblyBase = (long)baseAddress;
++        }
++        else
++        {
++            GameAssemblyBase = (long)Process.GetCurrentProcess()
++                .Modules.OfType<ProcessModule>()
++                .Single(x => x.ModuleName is "GameAssembly.dll" or "GameAssembly.so" or "UserAssembly.dll" || string.Equals(x.ModuleName, "GameAssembly.dll", StringComparison.OrdinalIgnoreCase))
++                .BaseAddress;
++        }
+     }
+
+     public static MethodBase TryResolvePointer(IntPtr methodStart)
+@@ -64,4 +116,27 @@ public static class XrefScanMethodDb
+
+         Marshal.WriteByte((IntPtr)(GameAssemblyBase + attribute.MetadataInitFlagRva), 1);
+     }
++
++    [StructLayout(LayoutKind.Sequential)]
++    private struct DlInfo
++    {
++        public IntPtr dli_fname;
++        public IntPtr dli_fbase;
++        public IntPtr dli_sname;
++        public IntPtr dli_saddr;
++    }
++
++    [DllImport("libSystem.dylib", EntryPoint = "dlopen", CallingConvention = CallingConvention.Cdecl,
++        CharSet = CharSet.Ansi)]
++    private static extern IntPtr dlopen(string filename, int flags);
++
++    [DllImport("libSystem.dylib", EntryPoint = "dlerror", CallingConvention = CallingConvention.Cdecl)]
++    private static extern IntPtr dlerror();
++
++    [DllImport("libSystem.dylib", EntryPoint = "dlsym", CallingConvention = CallingConvention.Cdecl,
++        CharSet = CharSet.Ansi)]
++    private static extern IntPtr dlsym(IntPtr handle, string symbol);
++
++    [DllImport("libSystem.dylib", EntryPoint = "dladdr", CallingConvention = CallingConvention.Cdecl)]
++    private static extern int dladdr(IntPtr addr, out DlInfo info);
+ }
+diff --git a/Il2CppInterop.Runtime/Injection/ClassInjector.cs b/Il2CppInterop.Runtime/Injection/ClassInjector.cs
+index b9fb648..b9db513 100644
+--- a/Il2CppInterop.Runtime/Injection/ClassInjector.cs
++++ b/Il2CppInterop.Runtime/Injection/ClassInjector.cs
+@@ -511,7 +511,7 @@ public static unsafe partial class ClassInjector
+         var TypeHierarchyDepth = 1 + baseClassPointer.TypeHierarchyDepth;
+         classPointer.TypeHierarchyDepth = (byte)TypeHierarchyDepth;
+         classPointer.TypeHierarchy = (Il2CppClass**)Marshal.AllocHGlobal(TypeHierarchyDepth * IntPtr.Size);
+-        for (var i = 0; i < TypeHierarchyDepth; i++)
++        for (var i = 0; i < baseClassPointer.TypeHierarchyDepth; i++)
+             classPointer.TypeHierarchy[i] = baseClassPointer.TypeHierarchy[i];
+         classPointer.TypeHierarchy[TypeHierarchyDepth - 1] = classPointer.ClassPointer;
+
+diff --git a/Il2CppInterop.Runtime/Injection/Hooks/Class_GetFieldDefaultValue_Hook.cs b/Il2CppInterop.Runtime/Injection/Hooks/Class_GetFieldDefaultValue_Hook.cs
+index cf06db2..fe4f65b 100644
+--- a/Il2CppInterop.Runtime/Injection/Hooks/Class_GetFieldDefaultValue_Hook.cs
++++ b/Il2CppInterop.Runtime/Injection/Hooks/Class_GetFieldDefaultValue_Hook.cs
+@@ -1,4 +1,4 @@
+-﻿using System;
++using System;
+ using System.Linq;
+ using System.Runtime.InteropServices;
+ using Il2CppInterop.Common;
+@@ -141,7 +141,7 @@ namespace Il2CppInterop.Runtime.Injection.Hooks
+             // inlined but we'll treat it the same even though it doesn't receive the type parameter the RDX register
+             // doesn't get cleared so we still get the same parameters
+             var classGetDefaultFieldValue = s_Signatures
+-                .Select(s => MemoryUtils.FindSignatureInModule(InjectorHelpers.Il2CppModule, s))
++                .Select(s => MemoryUtils.FindSignatureInBlock(InjectorHelpers.Il2CppModuleBaseAddress, InjectorHelpers.Il2CppModuleMemorySize, s))
+                 .FirstOrDefault(p => p != 0);
+
+             if (classGetDefaultFieldValue == 0)
+diff --git a/Il2CppInterop.Runtime/Injection/Hooks/GenericMethod_GetMethod_Hook.cs b/Il2CppInterop.Runtime/Injection/Hooks/GenericMethod_GetMethod_Hook.cs
+index 9fa480b..bba3452 100644
+--- a/Il2CppInterop.Runtime/Injection/Hooks/GenericMethod_GetMethod_Hook.cs
++++ b/Il2CppInterop.Runtime/Injection/Hooks/GenericMethod_GetMethod_Hook.cs
+@@ -60,7 +60,7 @@ namespace Il2CppInterop.Runtime.Injection.Hooks
+         public override IntPtr FindTargetMethod()
+         {
+             var genericMethodGetMethod = s_Signatures
+-                .Select(s => MemoryUtils.FindSignatureInModule(InjectorHelpers.Il2CppModule, s))
++                .Select(s => MemoryUtils.FindSignatureInBlock(InjectorHelpers.Il2CppModuleBaseAddress, InjectorHelpers.Il2CppModuleMemorySize, s))
+                 .FirstOrDefault(p => p != 0);
+
+             if (genericMethodGetMethod == 0)
+diff --git a/Il2CppInterop.Runtime/Injection/InjectorHelpers.cs b/Il2CppInterop.Runtime/Injection/InjectorHelpers.cs
+index 9418c06..8351f4e 100644
+--- a/Il2CppInterop.Runtime/Injection/InjectorHelpers.cs
++++ b/Il2CppInterop.Runtime/Injection/InjectorHelpers.cs
+@@ -1,22 +1,18 @@
+-﻿using System;
++using System;
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
+ using System.Diagnostics;
++using System.IO;
+ using System.Linq;
+ using System.Reflection;
+ using System.Reflection.Emit;
+ using System.Runtime.InteropServices;
+ using System.Threading;
+ using Il2CppInterop.Common;
+-using Il2CppInterop.Common.Extensions;
+-using Il2CppInterop.Common.XrefScans;
+ using Il2CppInterop.Runtime.Injection.Hooks;
+ using Il2CppInterop.Runtime.Runtime;
+ using Il2CppInterop.Runtime.Runtime.VersionSpecific.Assembly;
+-using Il2CppInterop.Runtime.Runtime.VersionSpecific.Class;
+-using Il2CppInterop.Runtime.Runtime.VersionSpecific.FieldInfo;
+ using Il2CppInterop.Runtime.Runtime.VersionSpecific.Image;
+-using Il2CppInterop.Runtime.Runtime.VersionSpecific.MethodInfo;
+ using Il2CppInterop.Runtime.Startup;
+ using Microsoft.Extensions.Logging;
+
+@@ -27,11 +23,9 @@ namespace Il2CppInterop.Runtime.Injection
+         internal static Assembly Il2CppMscorlib = typeof(Il2CppSystem.Type).Assembly;
+         internal static INativeAssemblyStruct InjectedAssembly;
+         internal static INativeImageStruct InjectedImage;
+-        internal static ProcessModule Il2CppModule = Process.GetCurrentProcess()
+-            .Modules.OfType<ProcessModule>()
+-            .Single((x) => x.ModuleName is "GameAssembly.dll" or "GameAssembly.dylib" or "GameAssembly.so" or "UserAssembly.dll" || string.Equals(x.ModuleName, "GameAssembly.dll", StringComparison.OrdinalIgnoreCase));
+-
+-        internal static IntPtr Il2CppHandle = NativeLibrary.Load("GameAssembly", typeof(InjectorHelpers).Assembly, null);
++        internal static IntPtr Il2CppModuleBaseAddress => GetIl2CppModuleBaseAddress();
++        internal static int Il2CppModuleMemorySize => GetIl2CppModuleMemorySize();
++        internal static IntPtr Il2CppHandle => GetIl2CppHandle();
+
+         internal static readonly Dictionary<Type, OpCode> StIndOpcodes = new()
+         {
+@@ -48,6 +42,47 @@ namespace Il2CppInterop.Runtime.Injection
+             [typeof(double)] = OpCodes.Stind_R8
+         };
+
++        private static int CalculateMachOSize(IntPtr baseAddress)
++        {
++            try
++            {
++                var ptr = (byte*)baseAddress;
++                var header = Marshal.PtrToStructure<MachHeader64>((IntPtr)ptr);
++
++                if (header.magic != 0xfeedfacf)
++                    return 0; // Ensure it's a valid 64-bit Mach-O header
++
++                long totalSize = 0;
++                var currentCmdPtr = ptr + sizeof(MachHeader64);
++
++                for (var i = 0; i < header.ncmds; i++)
++                {
++                    var lc = Marshal.PtrToStructure<LoadCommand>((IntPtr)currentCmdPtr);
++
++                    if (lc.cmd == 0x19)
++                    {
++                        var seg = Marshal.PtrToStructure<SegmentCommand64>((IntPtr)currentCmdPtr);
++
++                        // Accumulate virtual memory sizes from valid segments (e.g., __TEXT, __DATA)
++                        // We skip the PAGEZERO segment if it exists (usually native executables only, not dylibs)
++                        if (seg.segname != "__PAGEZERO")
++                        {
++                            totalSize += (long)seg.vmsize;
++                        }
++                    }
++
++                    currentCmdPtr += (int)lc.cmdsize;
++                }
++
++                return (int)totalSize;
++            }
++            catch
++            {
++                // Fail-safe protection against corrupted memory reads
++                return 0;
++            }
++        }
++
+         private static void CreateInjectedAssembly()
+         {
+             InjectedAssembly = UnityVersionHandler.NewAssembly();
+@@ -58,23 +93,89 @@ namespace Il2CppInterop.Runtime.Injection
+             InjectedImage.Assembly = InjectedAssembly.AssemblyPointer;
+             InjectedImage.Dynamic = 1;
+             InjectedImage.Name = InjectedAssembly.Name.Name;
++
+             if (InjectedImage.HasNameNoExt)
+                 InjectedImage.NameNoExt = InjectedAssembly.Name.Name;
+         }
+
++        private static IntPtr GetIl2CppModuleBaseAddress()
++        {
++            if (OperatingSystem.IsMacOS())
++            {
++                var symbolAddress = GetIl2CppExport(nameof(IL2CPP.il2cpp_init));
++
++                if (dladdr(symbolAddress, out var info) == 0)
++                {
++                    throw new InvalidOperationException();
++                }
++
++                var baseAddress = info.dli_fbase;
++                return baseAddress;
++            }
++
++            return Process.GetCurrentProcess()
++                .Modules.OfType<ProcessModule>()
++                .Single(x => x.ModuleName is "GameAssembly.dll" or "GameAssembly.so" or "UserAssembly.dll" || string.Equals(x.ModuleName, "GameAssembly.dll", StringComparison.OrdinalIgnoreCase))
++                .BaseAddress;
++        }
++
++        private static int GetIl2CppModuleMemorySize()
++        {
++            var memorySize = 0;
++
++            if (OperatingSystem.IsMacOS())
++            {
++                memorySize = CalculateMachOSize(Il2CppModuleBaseAddress);
++            }
++            else
++            {
++                memorySize = Process.GetCurrentProcess()
++                    .Modules.OfType<ProcessModule>()
++                    .Single(x => x.ModuleName is "GameAssembly.dll" or "GameAssembly.so" or "UserAssembly.dll" || string.Equals(x.ModuleName, "GameAssembly.dll", StringComparison.OrdinalIgnoreCase))
++                    .ModuleMemorySize;
++            }
++
++            return memorySize;
++        }
++
++        private static IntPtr GetIl2CppHandle()
++        {
++            var libraryName = "GameAssembly";
++
++            if (OperatingSystem.IsMacOS())
++            {
++                var procPath = Environment.ProcessPath!;
++                var appContentsPath = Directory.GetParent(procPath)!.Parent!.FullName;
++                var gameAssemblyPath = Path.Combine(appContentsPath, "Frameworks", "GameAssembly.dylib");
++
++                if (!File.Exists(gameAssemblyPath))
++                {
++                    throw new DllNotFoundException(
++                        $"Failed to load \"GameAssembly.dylib\" from path {gameAssemblyPath}");
++                }
++
++                libraryName = gameAssemblyPath;
++            }
++
++            return NativeLibrary.Load(libraryName, typeof(InjectorHelpers).Assembly, null);
++        }
++
+         private static readonly GenericMethod_GetMethod_Hook GenericMethodGetMethodHook = new();
+         private static readonly GenericMethod_GetMethod_Unity6_Hook GenericMethodGetMethodHook_Unity6 = new();
+         private static readonly MetadataCache_GetTypeInfoFromTypeDefinitionIndex_Hook GetTypeInfoFromTypeDefinitionIndexHook = new();
+         private static readonly Class_GetFieldDefaultValue_Hook GetFieldDefaultValueHook = new();
+         private static readonly Class_FromIl2CppType_Hook FromIl2CppTypeHook = new();
+         private static readonly Class_FromName_Hook FromNameHook = new();
++
+         internal static void Setup()
+         {
+             if (InjectedAssembly == null) CreateInjectedAssembly();
++
+             if (Il2CppInteropRuntime.Instance.UnityVersion.Major >= 6000)
+                 GenericMethodGetMethodHook_Unity6.ApplyHook();
+             else
+                 GenericMethodGetMethodHook.ApplyHook();
++
+             GetTypeInfoFromTypeDefinitionIndexHook.ApplyHook();
+             GetFieldDefaultValueHook.ApplyHook();
+             ClassInit ??= FindClassInit();
+@@ -84,20 +185,21 @@ namespace Il2CppInterop.Runtime.Injection
+
+         internal static long CreateClassToken(IntPtr classPointer)
+         {
+-            long newToken = Interlocked.Decrement(ref s_LastInjectedToken);
++            var newToken = Interlocked.Decrement(ref s_LastInjectedToken);
+             s_InjectedClasses[newToken] = classPointer;
+             return newToken;
+         }
+
+         internal static void AddTypeToLookup<T>(IntPtr typePointer) where T : class => AddTypeToLookup(typeof(T), typePointer);
++
+         internal static void AddTypeToLookup(Type type, IntPtr typePointer)
+         {
+-            string klass = type.Name;
++            var klass = type.Name;
+             if (klass == null) return;
+-            string namespaze = type.Namespace ?? string.Empty;
+-            var attribute = Attribute.GetCustomAttribute(type, typeof(Il2CppInterop.Runtime.Attributes.ClassInjectionAssemblyTargetAttribute)) as Il2CppInterop.Runtime.Attributes.ClassInjectionAssemblyTargetAttribute;
++            var namespaze = type.Namespace ?? string.Empty;
++            var attribute = Attribute.GetCustomAttribute(type, typeof(Attributes.ClassInjectionAssemblyTargetAttribute)) as Attributes.ClassInjectionAssemblyTargetAttribute;
+
+-            foreach (IntPtr image in (attribute is null) ? IL2CPP.GetIl2CppImages() : attribute.GetImagePointers())
++            foreach (var image in (attribute is null) ? IL2CPP.GetIl2CppImages() : attribute.GetImagePointers())
+             {
+                 s_ClassNameLookup.Add((namespaze, klass, image), typePointer);
+             }
+@@ -107,7 +209,8 @@ namespace Il2CppInterop.Runtime.Injection
+         {
+             if (!TryGetIl2CppExport(name, out var address))
+             {
+-                throw new NotSupportedException($"Couldn't find {name} in {Il2CppModule.ModuleName}'s exports");
++                var moduleName = Process.GetCurrentProcess().MainModule?.ModuleName;
++                throw new NotSupportedException($"Couldn't find {name} in {moduleName}'s exports");
+             }
+
+             return address;
+@@ -122,7 +225,7 @@ namespace Il2CppInterop.Runtime.Injection
+         {
+             if (proxyMethod == null) return IntPtr.Zero;
+
+-            FieldInfo methodInfoPointerField = Il2CppInteropUtils.GetIl2CppMethodInfoPointerFieldForGeneratedMethod(proxyMethod);
++            var methodInfoPointerField = Il2CppInteropUtils.GetIl2CppMethodInfoPointerFieldForGeneratedMethod(proxyMethod);
+             if (methodInfoPointerField == null)
+                 throw new ArgumentException($"Couldn't find the generated method info pointer for {proxyMethod.Name}");
+
+@@ -132,16 +235,19 @@ namespace Il2CppInterop.Runtime.Injection
+             IntPtr methodInfoPointer = (IntPtr)methodInfoPointerField.GetValue(null);
+             if (methodInfoPointer == IntPtr.Zero)
+                 throw new ArgumentException($"Generated method info pointer for {proxyMethod.Name} doesn't point to any il2cpp method info");
+-            INativeMethodInfoStruct methodInfo = UnityVersionHandler.Wrap((Il2CppMethodInfo*)methodInfoPointer);
++
++            var methodInfo = UnityVersionHandler.Wrap((Il2CppMethodInfo*)methodInfoPointer);
+             return methodInfo.MethodPointer;
+         }
+
+         private static long s_LastInjectedToken = -2;
+         internal static readonly ConcurrentDictionary<long, IntPtr> s_InjectedClasses = new();
++
+         /// <summary> (namespace, class, image) : class </summary>
+         internal static readonly Dictionary<(string _namespace, string _class, IntPtr imagePtr), IntPtr> s_ClassNameLookup = new();
+
+         #region Class::Init
++
+         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+         internal delegate void d_ClassInit(Il2CppClass* klass);
+         internal static d_ClassInit ClassInit;
+@@ -171,22 +277,28 @@ namespace Il2CppInterop.Runtime.Injection
+                     Logger.Instance.LogTrace("Picked mono_class_instance_size as a Class::Init substitute");
+                     return classInit;
+                 }
++
+                 if (TryGetIl2CppExport("mono_class_setup_vtable", out classInit))
+                 {
+                     Logger.Instance.LogTrace("Picked mono_class_setup_vtable as a Class::Init substitute");
+                     return classInit;
+                 }
++
+                 if (TryGetIl2CppExport(nameof(IL2CPP.il2cpp_class_has_references), out classInit))
+                 {
+                     Logger.Instance.LogTrace("Picked il2cpp_class_has_references as a Class::Init substitute");
+                     return classInit;
+                 }
+
+-                Logger.Instance.LogTrace("GameAssembly.dll: 0x{Il2CppModuleAddress}", Il2CppModule.BaseAddress.ToInt64().ToString("X2"));
+-                throw new NotSupportedException("Failed to use signature for Class::Init and a substitute cannot be found, please create an issue and report your unity version & game");
++                Logger.Instance.LogTrace("GameAssembly: 0x{ModuleAddress}", Il2CppModuleBaseAddress.ToInt64().ToString("X2"));
++
++                throw new NotSupportedException(
++                    "Failed to use signature for Class::Init and a substitute cannot be found, please create an " +
++                    "issue and report your unity version & game");
+             }
+-            nint pClassInit = s_ClassInitSignatures
+-                .Select(s => MemoryUtils.FindSignatureInModule(Il2CppModule, s))
++
++            var pClassInit = s_ClassInitSignatures
++                .Select(s => MemoryUtils.FindSignatureInBlock(Il2CppModuleBaseAddress, Il2CppModuleMemorySize, s))
+                 .FirstOrDefault(p => p != 0);
+
+             if (pClassInit == 0)
+@@ -199,6 +311,58 @@ namespace Il2CppInterop.Runtime.Injection
+
+             return Marshal.GetDelegateForFunctionPointer<d_ClassInit>(pClassInit);
+         }
++
+         #endregion
++
++        [StructLayout(LayoutKind.Sequential)]
++        private struct DlInfo
++        {
++            public IntPtr dli_fname;
++            public IntPtr dli_fbase;
++            public IntPtr dli_sname;
++            public IntPtr dli_saddr;
++        }
++
++        [StructLayout(LayoutKind.Sequential)]
++        private struct MachHeader64
++        {
++            public uint magic;
++            public int cputype;
++            public int cpusubtype;
++            public uint filetype;
++            public uint ncmds;
++            public uint sizeofcmds;
++            public uint flags;
++            public uint reserved;
++        }
++
++        [StructLayout(LayoutKind.Sequential)]
++        private struct LoadCommand
++        {
++            public uint cmd;
++            public uint cmdsize;
++        }
++
++        [StructLayout(LayoutKind.Sequential)]
++        private struct SegmentCommand64
++        {
++            public uint cmd;
++            public uint cmdsize;
++
++            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 16)]
++            public string segname;
++
++            public ulong vmaddr;
++            public ulong vmsize;
++            public ulong fileoff;
++            public ulong filesize;
++            public int maxprot;
++            public int initprot;
++            public uint nsects;
++            public uint flags;
++        }
++
++        [DllImport("libSystem.dylib", EntryPoint = "dladdr", CallingConvention = CallingConvention.Cdecl)]
++        private static extern int dladdr(IntPtr addr, out DlInfo info);
+     }
+ }
+diff --git a/Il2CppInterop.Runtime/MemoryUtils.cs b/Il2CppInterop.Runtime/MemoryUtils.cs
+index 9fd2abd..edf8ae3 100644
+--- a/Il2CppInterop.Runtime/MemoryUtils.cs
++++ b/Il2CppInterop.Runtime/MemoryUtils.cs
+@@ -10,6 +10,18 @@ namespace Il2CppInterop.Runtime;
+
+ internal class MemoryUtils
+ {
++    public static nint FindSignatureInBlock(nint block, long blockSize, SignatureDefinition sigDef)
++    {
++        // Retain the upstream guarded-region scan on Windows.
++        if (OperatingSystem.IsWindows())
++            return FindSignatureInModule(Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
++                .Single(module => module.BaseAddress == block), sigDef);
++        var ptr = FindSignatureInBlock(block, blockSize, sigDef.pattern, sigDef.mask, sigDef.offset);
++        if (ptr != 0 && sigDef.xref)
++            ptr = XrefScannerLowLevel.JumpTargets(ptr).FirstOrDefault();
++        return ptr;
++    }
++
+     public static unsafe nint FindSignatureInModule(ProcessModule module, SignatureDefinition sigDef)
+     {
+         // On newer Unity (6000.x) the loaded GameAssembly maps some pages PAGE_NOACCESS / guard pages; the raw
+diff --git a/Il2CppInterop.Runtime/Runtime/VersionSpecific/Class/Class_105_0.cs b/Il2CppInterop.Runtime/Runtime/VersionSpecific/Class/Class_105_0.cs
+new file mode 100644
+index 0000000..2dba34a
+--- /dev/null
++++ b/Il2CppInterop.Runtime/Runtime/VersionSpecific/Class/Class_105_0.cs
+@@ -0,0 +1,202 @@
++// Unity 6000.5 layout backported from ds5678/Il2CppInterop f46e88d0 (Class_105_0).
++using System;
++using System.Runtime.InteropServices;
++using Il2CppInterop.Runtime.Runtime.VersionSpecific.Type;
++namespace Il2CppInterop.Runtime.Runtime.VersionSpecific.Class
++{
++    [ApplicableToUnityVersionsSince("6000.5.0")]
++    public unsafe class NativeClassStructHandler_105_0 : INativeClassStructHandler
++    {
++        public int Size() => sizeof(Il2CppClass_105_0);
++        public INativeClassStruct CreateNewStruct(int vTableSlots)
++        {
++            IntPtr ptr = Marshal.AllocHGlobal(Size() + sizeof(VirtualInvokeData) * vTableSlots);
++            Il2CppClass_105_0* _ = (Il2CppClass_105_0*)ptr;
++            *_ = default;
++            return new NativeStructWrapper(ptr);
++        }
++        public INativeClassStruct Wrap(Il2CppClass* ptr)
++        {
++            if (ptr == null) return null;
++            return new NativeStructWrapper((IntPtr)ptr);
++        }
++        internal unsafe struct Il2CppClass_105_0
++        {
++            public Il2CppImage* image;
++            public void* gc_desc;
++            public byte* name;
++            public byte* namespaze;
++            public NativeTypeStructHandler_27_0.Il2CppType_27_0 byval_arg;
++            public NativeTypeStructHandler_27_0.Il2CppType_27_0 this_arg;
++            public Il2CppClass* element_class;
++            public Il2CppClass* castClass;
++            public Il2CppClass* declaringType;
++            public Il2CppClass* parent;
++            public void* generic_class;
++            public Il2CppMetadataTypeHandle typeMetadataHandle;
++            public void* interopData;
++            public Il2CppClass* klass;
++            public Il2CppFieldInfo* fields;
++            public Il2CppMethodInfo** methods;
++            public Il2CppClass** implementedInterfaces;
++            public Il2CppRuntimeInterfaceOffsetPair* interfaceOffsets;
++            public void* static_fields;
++            public void* init_data;
++            public Il2CppClass** typeHierarchy;
++            public void* events;
++            public void* properties;
++            public void* nestedTypes;
++            public void* unity_user_data;
++            public Il2CppGCHandle initializationExceptionGCHandle;
++            public uint cctor_started;
++            public uint cctor_finished_or_no_cctor;
++            public ulong cctor_thread;
++            public Il2CppMetadataGenericContainerHandle genericContainerHandle;
++            public uint instance_size;
++            public uint stack_slot_size;
++            public uint actualSize;
++            public uint element_size;
++            public int native_size;
++            public uint static_fields_size;
++            public uint thread_static_fields_size;
++            public int thread_static_fields_offset;
++            public uint flags;
++            public uint token;
++            public ushort method_count;
++            public ushort property_count;
++            public ushort field_count;
++            public ushort event_count;
++            public ushort nested_type_count;
++            public ushort vtable_count;
++            public ushort interfaces_count;
++            public ushort interface_offsets_count;
++            public byte typeHierarchyDepth;
++            public byte genericRecursionDepth;
++            public byte rank;
++            public byte minimumAlignment;
++            public byte packingSize;
++            public Bitfield0 _bitfield0;
++            public Bitfield1 _bitfield1;
++            internal enum Bitfield0 : byte
++            {
++                BIT_initialized_and_no_error = 0,
++                initialized_and_no_error = (1 << BIT_initialized_and_no_error),
++                BIT_initialized = 1,
++                initialized = (1 << BIT_initialized),
++                BIT_enumtype = 2,
++                enumtype = (1 << BIT_enumtype),
++                BIT_nullabletype = 3,
++                nullabletype = (1 << BIT_nullabletype),
++                BIT_is_generic = 4,
++                is_generic = (1 << BIT_is_generic),
++                BIT_has_references = 5,
++                has_references = (1 << BIT_has_references),
++                BIT_init_pending = 6,
++                init_pending = (1 << BIT_init_pending),
++                BIT_size_init_pending = 7,
++                size_init_pending = (1 << BIT_size_init_pending),
++            }
++            internal enum Bitfield1 : byte
++            {
++                BIT_size_inited = 0,
++                size_inited = (1 << BIT_size_inited),
++                BIT_has_finalize = 1,
++                has_finalize = (1 << BIT_has_finalize),
++                BIT_has_cctor = 2,
++                has_cctor = (1 << BIT_has_cctor),
++                BIT_is_blittable = 3,
++                is_blittable = (1 << BIT_is_blittable),
++                BIT_is_import_or_windows_runtime = 4,
++                is_import_or_windows_runtime = (1 << BIT_is_import_or_windows_runtime),
++                BIT_is_vtable_initialized = 5,
++                is_vtable_initialized = (1 << BIT_is_vtable_initialized),
++                BIT_is_byref_like = 6,
++                is_byref_like = (1 << BIT_is_byref_like),
++                BIT_has_inline_array = 7,
++                has_inline_array = (1 << BIT_has_inline_array),
++            }
++        }
++        internal class NativeStructWrapper : INativeClassStruct
++        {
++            public NativeStructWrapper(IntPtr ptr) => Pointer = ptr;
++            private static int _bitfield0offset = Marshal.OffsetOf<Il2CppClass_105_0>(nameof(Il2CppClass_105_0._bitfield0)).ToInt32();
++            private static int _bitfield1offset = Marshal.OffsetOf<Il2CppClass_105_0>(nameof(Il2CppClass_105_0._bitfield1)).ToInt32();
++            public IntPtr Pointer { get; }
++            private Il2CppClass_105_0* _ => (Il2CppClass_105_0*)Pointer;
++            public IntPtr VTable => IntPtr.Add(Pointer, sizeof(Il2CppClass_105_0));
++            public Il2CppClass* ClassPointer => (Il2CppClass*)Pointer;
++            public INativeTypeStruct ByValArg => UnityVersionHandler.Wrap((Il2CppTypeStruct*)&_->byval_arg);
++            public INativeTypeStruct ThisArg => UnityVersionHandler.Wrap((Il2CppTypeStruct*)&_->this_arg);
++            public ref uint InstanceSize => ref _->instance_size;
++            public ref ushort VtableCount => ref _->vtable_count;
++            public ref ushort InterfaceCount => ref _->interfaces_count;
++            public ref ushort InterfaceOffsetsCount => ref _->interface_offsets_count;
++            public ref byte TypeHierarchyDepth => ref _->typeHierarchyDepth;
++            public ref int NativeSize => ref _->native_size;
++            public ref uint ActualSize => ref _->actualSize;
++            public ref ushort MethodCount => ref _->method_count;
++            public ref ushort FieldCount => ref _->field_count;
++            public ref Il2CppClassAttributes Flags => ref *(Il2CppClassAttributes*)&_->flags;
++            public ref IntPtr Name => ref *(IntPtr*)&_->name;
++            public ref IntPtr Namespace => ref *(IntPtr*)&_->namespaze;
++            public ref Il2CppImage* Image => ref _->image;
++            public ref Il2CppClass* Parent => ref _->parent;
++            public ref Il2CppClass* ElementClass => ref _->element_class;
++            public ref Il2CppClass* CastClass => ref _->castClass;
++            public ref Il2CppClass* DeclaringType => ref _->declaringType;
++            public ref Il2CppClass* Class => ref _->klass;
++            public ref Il2CppFieldInfo* Fields => ref _->fields;
++            public ref Il2CppMethodInfo** Methods => ref _->methods;
++            public ref Il2CppClass** ImplementedInterfaces => ref _->implementedInterfaces;
++            public ref Il2CppRuntimeInterfaceOffsetPair* InterfaceOffsets => ref _->interfaceOffsets;
++            public ref Il2CppClass** TypeHierarchy => ref _->typeHierarchy;
++            public bool ValueType
++            {
++                get => ByValArg.ValueType && ThisArg.ValueType;
++                set { }
++            }
++            public bool Initialized
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_105_0.Bitfield0.BIT_initialized);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_105_0.Bitfield0.BIT_initialized, value);
++            }
++            public bool EnumType
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_105_0.Bitfield0.BIT_enumtype);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_105_0.Bitfield0.BIT_enumtype, value);
++            }
++            public bool IsGeneric
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_105_0.Bitfield0.BIT_is_generic);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_105_0.Bitfield0.BIT_is_generic, value);
++            }
++            public bool HasReferences
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_105_0.Bitfield0.BIT_has_references);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_105_0.Bitfield0.BIT_has_references, value);
++            }
++            public bool SizeInited
++            {
++                get => this.CheckBit(_bitfield1offset, (int)Il2CppClass_105_0.Bitfield1.BIT_size_inited);
++                set => this.SetBit(_bitfield1offset, (int)Il2CppClass_105_0.Bitfield1.BIT_size_inited, value);
++            }
++            public bool HasFinalize
++            {
++                get => this.CheckBit(_bitfield1offset, (int)Il2CppClass_105_0.Bitfield1.BIT_has_finalize);
++                set => this.SetBit(_bitfield1offset, (int)Il2CppClass_105_0.Bitfield1.BIT_has_finalize, value);
++            }
++            public bool IsVtableInitialized
++            {
++                get => this.CheckBit(_bitfield1offset, (int)Il2CppClass_105_0.Bitfield1.BIT_is_vtable_initialized);
++                set => this.SetBit(_bitfield1offset, (int)Il2CppClass_105_0.Bitfield1.BIT_is_vtable_initialized, value);
++            }
++            public bool InitializedAndNoError
++            {
++                get => this.CheckBit(_bitfield0offset, (int)Il2CppClass_105_0.Bitfield0.BIT_initialized_and_no_error);
++                set => this.SetBit(_bitfield0offset, (int)Il2CppClass_105_0.Bitfield0.BIT_initialized_and_no_error, value);
++            }
++        }
++
++    }
++
++}
